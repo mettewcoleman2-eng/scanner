@@ -1,0 +1,108 @@
+# CI per il repo scanner: scan del codice, dei manifest K8s e dei secret
+name: CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+# permessi minimi: il workflow legge il repo, niente write
+permissions:
+  contents: read
+
+jobs:
+  # ─────────────────────────────────────────────
+  # 1. Scan dei manifest K8s (kubesec + kube-score)
+  # ─────────────────────────────────────────────
+  scan-manifests:
+    name: Scan K8s manifests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install kube-score
+        run: |
+          curl -sSL https://github.com/zegl/kube-score/releases/latest/download/kube-score_linux_amd64.tar.gz | tar xz
+          sudo mv kube-score /usr/local/bin/
+
+      - name: Install kubesec
+        run: |
+          curl -sSL https://github.com/controlplaneio/kubesec/releases/latest/download/kubesec_linux_amd64.tar.gz | tar xz
+          sudo mv kubesec /usr/local/bin/
+
+      - name: Run kube-score (best practice K8s)
+        run: |
+          echo "=== kube-score ==="
+          find k8s -name '*.yaml' -exec kube-score score {} \; || true
+
+      - name: Run kubesec (security risk)
+        run: |
+          echo "=== kubesec ==="
+          find k8s -name '*.yaml' -exec kubesec scan {} \; || true
+
+  # ─────────────────────────────────────────────
+  # 2. Scan vulnerabilità delle immagini (Trivy fs)
+  # ─────────────────────────────────────────────
+  scan-trivy:
+    name: Scan with Trivy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run Trivy (filesystem, config, secrets)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          severity: 'HIGH,CRITICAL'
+          format: 'table'
+          exit-code: '0'        # '1' se vuoi bloccare la PR su finding critici
+          ignore-unfixed: true
+
+      - name: Run Trivy (secret scan)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          scanners: 'secret'
+          format: 'table'
+          exit-code: '0'
+
+  # ─────────────────────────────────────────────
+  # 3. Scan secret hardcoded (gitleaks)
+  # ─────────────────────────────────────────────
+  scan-secrets:
+    name: Scan for secrets
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ─────────────────────────────────────────────
+  # 4. Lint YAML (validazione sintassi)
+  # ─────────────────────────────────────────────
+  lint-yaml:
+    name: Lint YAML
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install yamllint
+        run: pip install yamllint
+
+      - name: Run yamllint
+        run: |
+          echo "=== yamllint ==="
+          yamllint -d relaxed k8s/ || true
