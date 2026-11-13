@@ -1,8 +1,8 @@
 # ============================================================
 # scanner-full.yaml
 # Repo: https://github.com/mettewcoleman2-eng/scanner
-# Path su Argo: . (root) oppure k8s/ se lo sposti
-# Applicato da Argo CD Application: scanner-app
+# Path Argo: . (root)  →  il file sta nella root del repo
+# Application Argo: scanner-app
 # ============================================================
 
 # ------------------------------------------------------------
@@ -92,7 +92,7 @@ data:
 
 ---
 # ------------------------------------------------------------
-# 6. CRONJOB — Trivy scan notturno di tutte le immagini del cluster
+# 6. CRONJOB — Trivy scan notturno (immagine verificata)
 # ------------------------------------------------------------
 apiVersion: batch/v1
 kind: CronJob
@@ -120,7 +120,7 @@ spec:
           restartPolicy: OnFailure
           containers:
             - name: trivy
-              image: aquasec/trivy:0.50.0
+              image: aquasec/trivy:0.58.1
               command: ["/bin/sh", "-c"]
               args:
                 - |
@@ -144,7 +144,7 @@ spec:
 
 ---
 # ------------------------------------------------------------
-# 7. JOB — job-reader (PostSync hook: legge job e log a ogni sync)
+# 7. JOB — job-reader (PostSync hook, immagine verificata con shell+kubectl)
 # ------------------------------------------------------------
 apiVersion: batch/v1
 kind: Job
@@ -169,7 +169,7 @@ spec:
       restartPolicy: Never
       containers:
         - name: reader
-          image: bitnami/kubectl:1.29
+          image: alpine/k8s:1.29.0
           command: ["/bin/sh", "-c"]
           args:
             - |
