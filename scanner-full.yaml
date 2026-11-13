@@ -1,0 +1,197 @@
+# ============================================================
+# scanner-full.yaml
+# Repo: https://github.com/mettewcoleman2-eng/scanner
+# Path su Argo: . (root) oppure k8s/ se lo sposti
+# Applicato da Argo CD Application: scanner-app
+# ============================================================
+
+# ------------------------------------------------------------
+# 1. NAMESPACE
+# ------------------------------------------------------------
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: scanner
+  labels:
+    app.kubernetes.io/part-of: scanner
+    name: scanner
+
+---
+# ------------------------------------------------------------
+# 2. SERVICE ACCOUNT
+# ------------------------------------------------------------
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: scanner-sa
+  namespace: scanner
+  labels:
+    app.kubernetes.io/part-of: scanner
+
+---
+# ------------------------------------------------------------
+# 3. CLUSTER ROLE (read-only, con pods/log)
+# ------------------------------------------------------------
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: scanner-read-only
+  labels:
+    app.kubernetes.io/part-of: scanner
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "services", "namespaces", "nodes", "configmaps"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets", "daemonsets", "replicasets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list", "watch"]
+
+---
+# ------------------------------------------------------------
+# 4. CLUSTER ROLE BINDING
+# ------------------------------------------------------------
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: scanner-read-only-binding
+  labels:
+    app.kubernetes.io/part-of: scanner
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: scanner-read-only
+subjects:
+  - kind: ServiceAccount
+    name: scanner-sa
+    namespace: scanner
+
+---
+# ------------------------------------------------------------
+# 5. CONFIGMAP (config degli scanner)
+# ------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: scanner-config
+  namespace: scanner
+  labels:
+    app.kubernetes.io/part-of: scanner
+data:
+  trivy.yaml: |
+    severity:
+      - HIGH
+      - CRITICAL
+    ignore-unfixed: true
+    scanners:
+      - vuln
+      - config
+  scan-schedule: "0 2 * * *"
+
+---
+# ------------------------------------------------------------
+# 6. CRONJOB — Trivy scan notturno di tutte le immagini del cluster
+# ------------------------------------------------------------
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: trivy-cluster-scan
+  namespace: scanner
+  labels:
+    app.kubernetes.io/part-of: scanner
+    app.kubernetes.io/component: trivy
+spec:
+  schedule: "0 2 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/part-of: scanner
+            app.kubernetes.io/component: trivy
+        spec:
+          serviceAccountName: scanner-sa
+          restartPolicy: OnFailure
+          containers:
+            - name: trivy
+              image: aquasec/trivy:0.50.0
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -e
+                  echo "[scanner] collecting images from cluster"
+                  kubectl get pods -A -o jsonpath='{range .items[*]}{.spec.containers[*].image}{"\n"}{.spec.initContainers[*].image}{"\n"}{end}' \
+                    | sort -u | grep -v '^$' > /tmp/images.txt || true
+                  echo "[scanner] found $(wc -l < /tmp/images.txt) unique images"
+                  while read img; do
+                    echo "=== scanning $img ==="
+                    trivy image --quiet --severity HIGH,CRITICAL --no-progress "$img" || true
+                  done < /tmp/images.txt
+                  echo "[scanner] done"
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 256Mi
+                limits:
+                  cpu: 500m
+                  memory: 512Mi
+
+---
+# ------------------------------------------------------------
+# 7. JOB — job-reader (PostSync hook: legge job e log a ogni sync)
+# ------------------------------------------------------------
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: job-reader
+  namespace: scanner
+  labels:
+    app.kubernetes.io/part-of: scanner
+    app.kubernetes.io/component: job-reader
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: scanner
+        app.kubernetes.io/component: job-reader
+    spec:
+      serviceAccountName: scanner-sa
+      restartPolicy: Never
+      containers:
+        - name: reader
+          image: bitnami/kubectl:1.29
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              echo "=== JOBS IN ALL NAMESPACES ==="
+              kubectl get jobs -A -o wide || true
+              echo ""
+              echo "=== PODS OF JOBS ==="
+              kubectl get pods -A -l job-name -o wide || true
+              echo ""
+              echo "=== LOGS OF EACH JOB ==="
+              for ns in $(kubectl get jobs -A -o jsonpath='{range .items[*]}{.metadata.namespace}{"\n"}{end}' | sort -u); do
+                for job in $(kubectl get jobs -n "$ns" -o jsonpath='{.items[*].metadata.name}'); do
+                  echo "--- ns=$ns job=$job ---"
+                  kubectl logs -n "$ns" -l "job-name=$job" --all-containers --tail=100 || true
+                  echo ""
+                done
+              done
+              echo "=== DONE ==="
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
